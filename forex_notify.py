@@ -2,14 +2,12 @@ name: Forex Calendar Notifier
 
 on:
   schedule:
-    # 7:00 AM MYT = 23:00 UTC (previous day)
     - cron: "0 23 * * *"
-  workflow_dispatch: # Allow manual trigger from GitHub UI
+  workflow_dispatch:
 
 jobs:
   send-forex-calendar:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
