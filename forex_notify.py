@@ -4,29 +4,66 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import pytz
 import time
+import re
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 MYT = pytz.timezone("Asia/Kuala_Lumpur")
+EST = pytz.timezone("America/New_York")
 
 IMPACT_EMOJI = {
-    "red":  "🔴",
-    "ora":  "🟠",
-    "yel":  "🟡",
-    "gra":  "⚪",
-}
-
-IMPACT_LABEL = {
-    "red":  "High",
-    "ora":  "Medium",
-    "yel":  "Low",
-    "gra":  "Non-Economic",
+    "high":   "🔴",
+    "medium": "🟠",
+    "low":    "🟡",
+    "none":   "⚪",
 }
 
 
-def get_session():
-    """Create a session that mimics a real browser visiting ForexFactory."""
+def convert_to_myt(time_str, date_myt):
+    """
+    Convert ForexFactory time string (EST/EDT) to MYT.
+    time_str examples: '8:30am', '2:00pm', 'All Day', 'Tentative'
+    date_myt: the current date in MYT (datetime object)
+    """
+    if not time_str or time_str in ("—", "All Day", "Tentative", ""):
+        return time_str or "—"
+
+    # Parse the time string
+    time_str_clean = time_str.strip().lower()
+    match = re.match(r"(\d{1,2}):(\d{2})(am|pm)", time_str_clean)
+    if not match:
+        return time_str  # Can't parse, return as-is
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    ampm = match.group(3)
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+
+    # ForexFactory shows the PREVIOUS day's evening events for the next day
+    # e.g. "9:00pm" on Monday's calendar = 9pm EST Monday
+    # Build the EST datetime using the MYT date as base
+    # MYT is UTC+8, EST is UTC-5 (EDT is UTC-4)
+    # When it's 7am MYT on Tuesday, it's still Monday evening in EST
+    # So we use the MYT date minus 1 day for overnight EST times
+    try:
+        # Try same day first in EST
+        est_dt = EST.localize(datetime(
+            date_myt.year, date_myt.month, date_myt.day,
+            hour, minute, 0
+        ))
+        myt_dt = est_dt.astimezone(MYT)
+        return myt_dt.strftime("%-I:%M%p").lower().replace("am", "am").replace("pm", "pm").upper()
+    except Exception:
+        return time_str
+
+
+def scrape_forexfactory():
+    """Scrape today's USD events from ForexFactory."""
     session = requests.Session()
     session.headers.update({
         "User-Agent": (
@@ -34,137 +71,163 @@ def get_session():
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": (
-            "text/html,application/xhtml+xml,application/xml;"
-            "q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     })
-    # Visit homepage first to get cookies (mimics real browser)
+
+    # Visit homepage first to grab cookies
     try:
         session.get("https://www.forexfactory.com/", timeout=15)
         time.sleep(2)
-    except Exception:
-        pass
-    return session
-
-
-def scrape_forexfactory():
-    """Scrape today's USD events from ForexFactory."""
-    session = get_session()
+    except Exception as e:
+        print(f"Homepage visit warning: {e}")
 
     now_myt = datetime.now(MYT)
-    # FF uses format like: jun22.2026
     date_str = now_myt.strftime("%b%d.%Y").lower()
     url = f"https://www.forexfactory.com/calendar?day={date_str}"
+    print(f"Fetching: {url}")
 
     response = session.get(url, timeout=15)
+    print(f"HTTP status: {response.status_code}")
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
-    rows = soup.select("tr.calendar__row")
+    soup = BeautifulSoup(response.text, "lxml")
+
+    rows = (
+        soup.select("tr.calendar__row--grey, tr.calendar__row")
+        or soup.select("tr[class*='calendar__row']")
+        or soup.select("table.calendar tr")
+    )
+    print(f"Total rows found: {len(rows)}")
 
     events = []
-    current_time = None
+    current_time_raw = None
 
     for row in rows:
-        # ForexFactory reuses time cell across grouped rows — carry it forward
-        time_cell = row.select_one("td.calendar__time")
-        if time_cell:
-            raw_time = time_cell.get_text(strip=True)
-            if raw_time and raw_time.lower() not in ("", "all day", "tentative"):
-                current_time = raw_time
+        # Time (carried forward across merged rows)
+        for sel in ["td.calendar__time", "td[class*='calendar__time']"]:
+            time_cell = row.select_one(sel)
+            if time_cell:
+                raw = time_cell.get_text(strip=True)
+                if raw and raw.lower() not in ("", "all day", "tentative", "data"):
+                    current_time_raw = raw
+                break
 
-        currency_cell = row.select_one("td.calendar__currency")
-        if not currency_cell:
-            continue
-        currency = currency_cell.get_text(strip=True)
+        # Currency
+        currency = ""
+        for sel in ["td.calendar__currency", "td[class*='calendar__currency']"]:
+            el = row.select_one(sel)
+            if el:
+                currency = el.get_text(strip=True)
+                break
         if currency != "USD":
             continue
 
-        # Impact colour class
-        impact_class = ""
-        impact_span = row.select_one("td.calendar__impact span")
-        if impact_span:
-            for cls in impact_span.get("class", []):
-                for key in IMPACT_EMOJI:
-                    if key in cls:
-                        impact_class = key
-                        break
+        # Impact
+        impact = "none"
+        for sel in ["td.calendar__impact span", "td[class*='impact'] span"]:
+            span = row.select_one(sel)
+            if span:
+                cls_str = " ".join(span.get("class", []))
+                if "red" in cls_str or "high" in cls_str:
+                    impact = "high"
+                elif "ora" in cls_str or "medium" in cls_str or "orange" in cls_str:
+                    impact = "medium"
+                elif "yel" in cls_str or "low" in cls_str or "yellow" in cls_str:
+                    impact = "low"
+                break
 
         # Event name
-        name_el = row.select_one("td.calendar__event span.calendar__event-title")
-        if not name_el:
-            name_el = row.select_one("td.calendar__event")
-        event_name = name_el.get_text(strip=True) if name_el else "Unknown Event"
+        event_name = ""
+        for sel in [
+            "td.calendar__event span.calendar__event-title",
+            "td[class*='event'] span[class*='title']",
+            "td.calendar__event",
+            "td[class*='event']",
+        ]:
+            el = row.select_one(sel)
+            if el:
+                event_name = el.get_text(strip=True)
+                break
+        if not event_name:
+            continue
 
-        def cell_text(selector):
-            el = row.select_one(selector)
-            return el.get_text(strip=True) if el else ""
+        def cell_text(selectors):
+            for s in selectors:
+                el = row.select_one(s)
+                if el:
+                    return el.get_text(strip=True)
+            return ""
+
+        # Convert EST time to MYT
+        myt_time = convert_to_myt(current_time_raw, now_myt)
 
         events.append({
-            "time":     current_time or "—",
-            "impact":   impact_class,
+            "time":     myt_time,
+            "impact":   impact,
             "event":    event_name,
-            "forecast": cell_text("td.calendar__forecast"),
-            "previous": cell_text("td.calendar__previous"),
-            "actual":   cell_text("td.calendar__actual"),
+            "forecast": cell_text(["td.calendar__forecast", "td[class*='forecast']"]),
+            "previous": cell_text(["td.calendar__previous", "td[class*='previous']"]),
+            "actual":   cell_text(["td.calendar__actual",   "td[class*='actual']"]),
         })
 
     return events
 
 
 def format_message(events):
-    """Format events into a clean Telegram message."""
     now_myt = datetime.now(MYT)
     date_str = now_myt.strftime("%A, %d %B %Y")
 
-    header = (
-        f"📅 *USD Economic Calendar*\n"
-        f"_{date_str} — Malaysia Time (MYT)_\n"
-    )
-
     if not events:
-        return header + "\n✅ No USD events scheduled today. Clean slate! 🧘"
+        return (
+            f"📅 *USD Economic Calendar*\n"
+            f"_{date_str}_\n\n"
+            f"✅ No USD events today\. Clean slate\! 🧘"
+        )
 
-    lines = [header, "```"]
+    lines = [
+        f"📅 *USD Economic Calendar*",
+        f"_{date_str}_",
+        f"🇲🇾 _All times in Malaysia Time \(MYT\)_",
+        f"",
+    ]
 
     for e in events:
-        emoji  = IMPACT_EMOJI.get(e["impact"], "⚪")
-        label  = IMPACT_LABEL.get(e["impact"], "N/A")
-        time_s = e["time"].rjust(8)
+        emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
+        # Escape special MarkdownV2 chars in event name
+        safe_name = (e["event"]
+            .replace("-", "\\-").replace(".", "\\.").replace("(", "\\(")
+            .replace(")", "\\)").replace("!", "\\!").replace(">", "\\>"))
 
-        lines.append(f"{time_s}  {emoji} {label}")
-        lines.append(f"  ➤ {e['event']}")
+        lines.append(f"🕐 `{e['time']}`  {emoji}")
+        lines.append(f"*{safe_name}*")
 
         details = []
         if e["forecast"]:
-            details.append(f"Fcst: {e['forecast']}")
+            details.append(f"Fcst: `{e['forecast']}`")
         if e["previous"]:
-            details.append(f"Prev: {e['previous']}")
+            details.append(f"Prev: `{e['previous']}`")
         if details:
-            lines.append(f"  {'  |  '.join(details)}")
-        lines.append("")
+            lines.append("  ".join(details))
+        lines.append("——————————————")
 
-    lines.append("```")
-    lines.append("_Source: ForexFactory.com_")
-
+    lines.append("_Source: ForexFactory\\.com_")
     return "\n".join(lines)
 
 
 def send_telegram(message):
-    """Send message to Telegram channel."""
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id":                  TELEGRAM_CHAT_ID,
         "text":                     message,
-        "parse_mode":               "Markdown",
+        "parse_mode":               "MarkdownV2",
         "disable_web_page_preview": True,
     }
     r = requests.post(url, json=payload, timeout=10)
+    if not r.ok:
+        print(f"Telegram error body: {r.text}")
     r.raise_for_status()
     print(f"✅ Sent! Status: {r.status_code}")
 
@@ -172,10 +235,10 @@ def send_telegram(message):
 def main():
     print("📡 Scraping ForexFactory for today's USD events...")
     events = scrape_forexfactory()
-    print(f"   Found {len(events)} USD events.")
+    print(f"Found {len(events)} USD events.")
 
     message = format_message(events)
-    print("\n--- Preview ---")
+    print("\n--- Message Preview ---")
     print(message)
     print("--- End Preview ---\n")
 
