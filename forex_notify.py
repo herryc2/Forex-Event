@@ -30,6 +30,7 @@ IMPACT_EMOJI = {
 }
 
 CACHE_FILE = ".calendar_cache.json"
+STATE_FILE = ".bot_state.json"
 FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
@@ -44,6 +45,44 @@ def escape_html(text):
     if not text:
         return ""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def load_state():
+    """Loads the current bot state from a local file, resetting it if a new day has started."""
+    today_str = get_myt_now().strftime("%Y-%m-%d")
+    default_state = {
+        "date": today_str,
+        "daily_calendar_msg_id": None,
+        "sent_warnings": [],
+        "sent_announcements": []
+    }
+    
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            # Reset state on a new day
+            if state.get("date") != today_str:
+                print(f"ℹ️ New day detected ({today_str}). Resetting bot state.")
+                save_state(default_state)
+                return default_state
+            return state
+        except Exception as e:
+            print(f"⚠️ Error reading state file: {e}")
+            
+    return default_state
+
+def save_state(state):
+    """Saves the bot state to the local file."""
+    try:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ Error writing to state file: {e}")
+
+def get_event_id(e):
+    """Generates a unique identifier for an event based on its datetime, country, and title."""
+    date_part = e["datetime"].isoformat() if isinstance(e.get("datetime"), datetime) else str(e.get("datetime"))
+    return f"{date_part}_{e.get('country')}_{e.get('title')}"
 
 def fetch_calendar_data():
     """
@@ -181,12 +220,13 @@ def format_html_message(events):
     return msg
 
 def send_telegram(message):
-    """Sends the formatted HTML message to Telegram."""
+    """Sends the formatted HTML message to Telegram and returns the message ID if successful."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("❌ Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables are not set.")
         print("Stdout representation of the message:")
         print(message)
-        return False
+        # Mock message ID for testing
+        return 999999
         
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -207,20 +247,61 @@ def send_telegram(message):
         with urllib.request.urlopen(req, timeout=15) as response:
             resp_data = json.loads(response.read().decode("utf-8"))
             if resp_data.get("ok"):
-                print("✅ Telegram message sent successfully!")
-                return True
+                msg_id = resp_data["result"]["message_id"]
+                print(f"✅ Telegram message sent successfully! Message ID: {msg_id}")
+                return msg_id
             else:
                 print(f"❌ Telegram API Error: {resp_data}")
-                return False
+                return None
     except urllib.error.HTTPError as e:
         print(f"❌ Telegram HTTP Error: {e.code} {e.reason}")
         try:
             print("Response:", e.read().decode("utf-8"))
         except Exception:
             pass
-        return False
+        return None
     except Exception as e:
         print(f"❌ Telegram Send Error: {e}")
+        return None
+
+def edit_telegram_message(message_id, new_text):
+    """Edits an existing Telegram message with new HTML content."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print(f"⚠️ Simulated Telegram Edit (Message {message_id}):")
+        print(new_text)
+        print("------------------------------------------")
+        return True
+        
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": new_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True
+    }
+    
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            resp_data = json.loads(response.read().decode("utf-8"))
+            if resp_data.get("ok"):
+                print(f"✅ Telegram message {message_id} updated successfully!")
+                return True
+            else:
+                print(f"❌ Telegram Edit API Error: {resp_data}")
+                return False
+    except urllib.error.HTTPError as e:
+        print(f"❌ Telegram Edit HTTP Error: {e.code} {e.reason}")
+        return False
+    except Exception as e:
+        print(f"❌ Telegram Edit Error: {e}")
         return False
 
 def main():
@@ -228,20 +309,76 @@ def main():
     
     # 1. Fetch
     raw_data = fetch_calendar_data()
-    
+    if not raw_data:
+        print("❌ No calendar data retrieved. Exiting.")
+        return
+        
     # 2. Filter & Process
     events = get_todays_events(raw_data)
     print(f"Found {len(events)} matching events for today.")
     
-    # 3. Format
-    message = format_html_message(events)
+    # 3. Load state
+    state = load_state()
+    now = get_myt_now()
+    state_updated = False
     
-    # 4. Output / Send
-    print("\n--- Formatted Output ---")
-    print(message)
-    print("------------------------\n")
-    
-    send_telegram(message)
+    # 4. Check/Send Daily Calendar Overview
+    current_overview = format_html_message(events)
+    if not state.get("daily_calendar_msg_id"):
+        print("Sending initial daily calendar overview...")
+        msg_id = send_telegram(current_overview)
+        if msg_id:
+            state["daily_calendar_msg_id"] = msg_id
+            state_updated = True
+    else:
+        print(f"Updating existing daily calendar overview message ({state['daily_calendar_msg_id']})...")
+        edit_telegram_message(state["daily_calendar_msg_id"], current_overview)
+        
+    # 5. Check 10-Minute Warnings & Rate Announcements
+    for e in events:
+        event_id = get_event_id(e)
+        event_time = e["datetime"]
+        
+        # Time difference in seconds between event time and now
+        time_diff = (event_time - now).total_seconds()
+        
+        # A. 10-Minute warning (Trigger if event starts in the next 10 minutes (600s) and has not started yet)
+        if 0 < time_diff <= 600:
+            if event_id not in state["sent_warnings"]:
+                emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
+                warning_msg = (
+                    f"⚠️ <b>Upcoming Forex Event (10 mins)</b>\n\n"
+                    f"{emoji} <b>{e['time_str']}</b> - <b>{escape_html(e['country'])}</b>\n"
+                    f"👉 <code>{escape_html(e['title'])}</code>\n"
+                )
+                if e["forecast"]:
+                    warning_msg += f"<blockquote>Fcst: {escape_html(e['forecast'])} | Prev: {escape_html(e['previous'])}</blockquote>"
+                
+                print(f"Sending 10-minute warning alert for: {e['title']}")
+                if send_telegram(warning_msg):
+                    state["sent_warnings"].append(event_id)
+                    state_updated = True
+                    
+        # B. Rate announcement (Trigger if event time has passed/is occurring now AND an actual value is available)
+        elif time_diff <= 0 and e["actual"]:
+            if event_id not in state["sent_announcements"]:
+                emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
+                announcement_msg = (
+                    f"📢 <b>Forex Rate Announced</b>\n\n"
+                    f"{emoji} <b>{e['time_str']}</b> - <b>{escape_html(e['country'])}</b>\n"
+                    f"👉 <code>{escape_html(e['title'])}</code>\n"
+                    f"<blockquote>Act: <b>{escape_html(e['actual'])}</b> | Fcst: {escape_html(e['forecast'])} | Prev: {escape_html(e['previous'])}</blockquote>"
+                )
+                
+                print(f"Sending rate announcement alert for: {e['title']}")
+                if send_telegram(announcement_msg):
+                    state["sent_announcements"].append(event_id)
+                    state_updated = True
+                    
+    if state_updated:
+        save_state(state)
+        
+    print("Bot cycle finished.")
 
 if __name__ == "__main__":
     main()
