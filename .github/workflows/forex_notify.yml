@@ -1,8 +1,6 @@
 name: Forex Live News Alerts
 
 on:
-  push:
-    branches: [main]  # Temporary one-time production test
   schedule:
     # Malaysia weekdays: Sunday 16:00 UTC through Friday 15:59 UTC.
     - cron: "*/5 16-23 * * 0-4"
