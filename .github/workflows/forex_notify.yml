@@ -1,8 +1,6 @@
 name: Forex Live News Alerts
 
 on:
-  push:
-    branches: [main]  # Temporary notification test
   schedule:
     # Malaysia weekdays: Sunday 16:00 UTC through Friday 15:59 UTC.
     - cron: "*/5 16-23 * * 0-4"
@@ -35,7 +33,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          RUN_MODE: ${{ github.event_name == 'schedule' && 'scheduled' || 'all' }}
+          RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && 'all' || 'scheduled' }}
           CURRENCIES: USD
           IMPACT_LEVELS: high,medium
         run: python forex_notify.py
