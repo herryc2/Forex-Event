@@ -2,12 +2,13 @@ name: Forex Calendar Notifier
 
 on:
   schedule:
-    - cron: "0 23 * * *"
+    - cron: "17 23 * * *"  # Daily at 07:17 Malaysia Time (UTC+8)
   workflow_dispatch:
 
 jobs:
   send-forex-calendar:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
