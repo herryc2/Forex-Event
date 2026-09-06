@@ -1,388 +1,305 @@
+import hashlib
+import html
+import json
 import os
 import sys
-import json
-import urllib.request
+import time
 import urllib.error
-from datetime import datetime, timezone, timedelta
+import urllib.request
+from datetime import datetime, timedelta, timezone
 
-# ===== Config & Setup =====
-
-# Timezone config: Primary uses standard zoneinfo, fallback to UTC+8 if tzdata is not installed.
 try:
     from zoneinfo import ZoneInfo
     MYT = ZoneInfo("Asia/Kuala_Lumpur")
 except Exception:
     MYT = timezone(timedelta(hours=8))
 
-# Telegram credentials
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+RUN_MODE = os.getenv("RUN_MODE", "scheduled").strip().lower()
+CURRENCIES = [x.strip().upper() for x in os.getenv("CURRENCIES", "USD").split(",") if x.strip()]
+IMPACTS = [x.strip().lower() for x in os.getenv("IMPACT_LEVELS", "high,medium").split(",") if x.strip()]
 
-# Customizable settings (via env variables or defaults)
-CURRENCIES = [c.strip().upper() for c in os.environ.get("CURRENCIES", "USD").split(",") if c.strip()]
-IMPACT_LEVELS = [i.strip().lower() for i in os.environ.get("IMPACT_LEVELS", "high,medium").split(",") if i.strip()]
+FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+STATE_FILE = ".bot_state.json"
+USER_AGENT = "Mozilla/5.0 (compatible; ForexEventBot/2.0)"
+MAX_MESSAGE_LENGTH = 4000
 
-# Impact emoji markers
-IMPACT_EMOJI = {
-    "high": "🔴",
-    "medium": "🟠",
-    "low": "🟡",
-    "none": "⚪"
+IMPACT_EMOJI = {"high": "🔴", "medium": "🟠", "low": "🟡", "none": "⚪"}
+PAIR_MAP = {
+    "USD": "XAU/USD · EUR/USD · GBP/USD · USD/JPY",
+    "EUR": "EUR/USD · EUR/GBP · EUR/JPY",
+    "GBP": "GBP/USD · EUR/GBP · GBP/JPY",
+    "JPY": "USD/JPY · EUR/JPY · GBP/JPY",
+    "AUD": "AUD/USD · AUD/JPY · AUD/NZD",
+    "NZD": "NZD/USD · AUD/NZD · NZD/JPY",
+    "CAD": "USD/CAD · CAD/JPY · EUR/CAD",
+    "CHF": "USD/CHF · EUR/CHF · CHF/JPY",
 }
 
-CACHE_FILE = ".calendar_cache.json"
-STATE_FILE = ".bot_state.json"
-FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# ===== Helpers =====
-
-def get_myt_now():
-    """Returns the current datetime in Malaysia Time (MYT)."""
+def now_myt():
     return datetime.now(MYT)
 
-def escape_html(text):
-    """Escapes HTML characters to prevent Telegram API parsing errors."""
-    if not text:
-        return ""
-    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def esc(value):
+    return html.escape(str(value or ""), quote=False)
+
+
+def default_state(today):
+    return {
+        "date": today,
+        "daily_calendar_msg_id": None,
+        "daily_calendar_hash": None,
+        "sent_warnings": [],
+        "sent_announcements": [],
+    }
+
 
 def load_state():
-    """Loads the current bot state from a local file, resetting it if a new day has started."""
-    today_str = get_myt_now().strftime("%Y-%m-%d")
-    default_state = {
-        "date": today_str,
-        "daily_calendar_msg_id": None,
-        "sent_warnings": [],
-        "sent_announcements": []
-    }
-    
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                state = json.load(f)
-            # Reset state on a new day
-            if state.get("date") != today_str:
-                print(f"ℹ️ New day detected ({today_str}). Resetting bot state.")
-                save_state(default_state)
-                return default_state
-            return state
-        except Exception as e:
-            print(f"⚠️ Error reading state file: {e}")
-            
-    return default_state
+    today = now_myt().strftime("%Y-%m-%d")
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as handle:
+            state = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        state = default_state(today)
+    if state.get("date") != today:
+        state = default_state(today)
+    for key in ("sent_warnings", "sent_announcements"):
+        state.setdefault(key, [])
+    return state
+
 
 def save_state(state):
-    """Saves the bot state to the local file."""
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ Error writing to state file: {e}")
+    temporary = STATE_FILE + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(temporary, STATE_FILE)
 
-def get_event_id(e):
-    """Generates a unique identifier for an event based on its datetime, country, and title."""
-    date_part = e["datetime"].isoformat() if isinstance(e.get("datetime"), datetime) else str(e.get("datetime"))
-    return f"{date_part}_{e.get('country')}_{e.get('title')}"
 
-def fetch_calendar_data():
-    """
-    Fetches the JSON calendar data from Forex Factory feed.
-    If the fetch fails (e.g. Cloudflare 429 rate limit or network issue),
-    it will fall back to reading from a locally cached file.
-    """
-    print(f"[{get_myt_now().strftime('%Y-%m-%d %H:%M:%S')}] Fetching calendar feed from {FEED_URL}...")
-    
-    req = urllib.request.Request(FEED_URL, headers={"User-Agent": USER_AGENT})
-    
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            content = response.read().decode("utf-8")
-            data = json.loads(content)
-            
-            # Save to cache
-            try:
-                with open(CACHE_FILE, "w", encoding="utf-8") as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
-                print("✅ Feed fetched successfully and saved to local cache.")
-            except Exception as cache_err:
-                print(f"⚠️ Warning: Could not write to cache file: {cache_err}")
-                
-            return data
-            
-    except urllib.error.HTTPError as e:
-        print(f"⚠️ HTTP Error: {e.code} {e.reason}")
-        if e.code == 429:
-            print("⚠️ Rate limit (429) hit. Attempting to fall back to cached calendar data...")
-        return load_cached_data()
-    except Exception as e:
-        print(f"⚠️ Network/Fetch Error: {e}")
-        return load_cached_data()
-
-def load_cached_data():
-    """Loads the calendar data from the local cache file."""
-    if os.path.exists(CACHE_FILE):
+def request_json(url, payload=None):
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"User-Agent": USER_AGENT}
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
+    attempts = 3 if data is None else 1  # Never retry Telegram POSTs automatically.
+    for attempt in range(1, attempts + 1):
         try:
-            with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            print("ℹ️ Successfully loaded calendar data from local cache.")
-            return data
-        except Exception as e:
-            print(f"❌ Error reading cache file: {e}")
-    else:
-        print("❌ Local cache file does not exist.")
-    return []
+            with urllib.request.urlopen(request, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+            if attempt == attempts:
+                raise RuntimeError(f"Request failed: {exc}") from exc
+            time.sleep(attempt * 2)
 
-def get_todays_events(data):
-    """
-    Processes the raw JSON feed data, filters for targeted currencies and impact levels,
-    converts date times to MYT, and isolates today's events.
-    """
-    today_myt = get_myt_now().strftime("%Y-%m-%d")
+
+def fetch_events():
+    print(f"Fetching Forex Factory calendar at {now_myt():%Y-%m-%d %H:%M:%S} MYT")
+    data = request_json(FEED_URL)
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("Calendar feed returned no events")
+    return data
+
+
+def parse_events(data):
+    today = now_myt().date()
     events = []
-    
     for item in data:
-        country = str(item.get("country") or item.get("Country") or "").upper()
-        if country not in CURRENCIES:
-            continue
-            
+        currency = str(item.get("country") or item.get("Country") or "").upper()
         impact = str(item.get("impact") or item.get("Impact") or "").lower()
-        if impact not in IMPACT_LEVELS:
+        if currency not in CURRENCIES or impact not in IMPACTS:
             continue
-            
-        date_str = item.get("date") or item.get("Date")
-        if not date_str:
+        raw_date = item.get("date") or item.get("Date")
+        if not raw_date:
             continue
-            
         try:
-            # Parse ISO 8601 date string (supports timezone offsets natively)
-            event_dt = datetime.fromisoformat(date_str)
-            # Convert to MYT
-            myt_dt = event_dt.astimezone(MYT)
-            
-            # Filter for events occurring today in Malaysia Time
-            if myt_dt.strftime("%Y-%m-%d") != today_myt:
-                continue
-                
-            events.append({
-                "datetime": myt_dt,
-                "time_str": myt_dt.strftime("%I:%M %p"),
-                "impact": impact,
-                "country": country,
-                "title": item.get("title") or item.get("Title") or "",
-                "forecast": item.get("forecast") or item.get("Forecast") or "",
-                "previous": item.get("previous") or item.get("Previous") or "",
-                "actual": item.get("actual") or item.get("Actual") or ""
-            })
-        except Exception as e:
-            # Skip individually malformed events without failing the entire run
-            print(f"⚠️ Skip event parsing: {e} for item: {item}")
-            
-    # Sort events chronologically by their datetime objects
-    events.sort(key=lambda x: x["datetime"])
-    return events
+            event_time = datetime.fromisoformat(str(raw_date).replace("Z", "+00:00")).astimezone(MYT)
+        except (TypeError, ValueError) as exc:
+            print(f"Skipping malformed event date {raw_date!r}: {exc}")
+            continue
+        if event_time.date() != today:
+            continue
+        events.append({
+            "datetime": event_time,
+            "currency": currency,
+            "impact": impact,
+            "title": str(item.get("title") or item.get("Title") or "Untitled event"),
+            "forecast": str(item.get("forecast") or item.get("Forecast") or ""),
+            "previous": str(item.get("previous") or item.get("Previous") or ""),
+            "actual": str(item.get("actual") or item.get("Actual") or ""),
+        })
+    return sorted(events, key=lambda event: event["datetime"])
 
-def format_html_message(events):
-    """Formats the list of events into a premium Telegram HTML message."""
-    today = get_myt_now().strftime("%A, %d %B %Y")
-    
-    # Header
-    msg = (
-        f"📅 <b>Economic Calendar</b>\n"
-        f"<b>Date:</b> {today}\n"
-        f"<b>Timezone:</b> Malaysia Time (MYT)\n"
-        f"<b>Filter:</b> {', '.join(CURRENCIES)} | {', '.join([i.upper() for i in IMPACT_LEVELS])}\n\n"
-    )
-    
+
+def event_id(event):
+    raw = f"{event['datetime'].isoformat()}|{event['currency']}|{event['title']}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:20]
+
+
+def comparison(actual, forecast):
+    if not actual or not forecast:
+        return ""
+    number = r"[-+]?\d+(?:\.\d+)?"
+    import re
+    actual_match = re.search(number, actual.replace(",", ""))
+    forecast_match = re.search(number, forecast.replace(",", ""))
+    if not actual_match or not forecast_match:
+        return ""
+    actual_value, forecast_value = float(actual_match.group()), float(forecast_match.group())
+    if actual_value > forecast_value:
+        return "📈 Actual came in above forecast"
+    if actual_value < forecast_value:
+        return "📉 Actual came in below forecast"
+    return "➖ Actual matched forecast"
+
+
+def event_lines(event, include_pairs=False):
+    marker = IMPACT_EMOJI.get(event["impact"], "⚪")
+    lines = [
+        f"{marker} <b>{event['datetime']:%I:%M %p}</b> · <b>{esc(event['currency'])}</b>",
+        f"<b>{esc(event['title'])}</b>",
+    ]
+    values = []
+    if event["actual"]:
+        values.append(f"Actual: <b>{esc(event['actual'])}</b>")
+    if event["forecast"]:
+        values.append(f"Forecast: {esc(event['forecast'])}")
+    if event["previous"]:
+        values.append(f"Previous: {esc(event['previous'])}")
+    if values:
+        lines.append(" · ".join(values))
+    if include_pairs and PAIR_MAP.get(event["currency"]):
+        lines.append(f"Pairs to watch: <i>{PAIR_MAP[event['currency']]}</i>")
+    return lines
+
+
+def build_overview(events):
+    current = now_myt()
+    lines = [
+        "📅 <b>FOREX ECONOMIC CALENDAR</b>",
+        f"<b>{current:%A, %d %B %Y}</b>",
+        "🇲🇾 Malaysia Time (MYT)",
+        f"Filter: {', '.join(CURRENCIES)} · {', '.join(x.upper() for x in IMPACTS)}",
+        "────────────────────",
+    ]
     if not events:
-        msg += "✅ <i>No matching events scheduled for today.</i>"
-        return msg
-        
-    for e in events:
-        emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
-        
-        # Event title row: [Emoji] [Time] - [Country]: [Title]
-        msg += f"{emoji} <b>{e['time_str']}</b> - <b>{escape_html(e['country'])}</b>\n"
-        msg += f"👉 <code>{escape_html(e['title'])}</code>\n"
-        
-        # Details row
-        details = []
-        if e["forecast"]:
-            details.append(f"Act: {escape_html(e['actual']) if e['actual'] else '⌛'}")
-            details.append(f"Fcst: {escape_html(e['forecast'])}")
-        if e["previous"]:
-            details.append(f"Prev: {escape_html(e['previous'])}")
-            
-        if details:
-            msg += f"<blockquote>{ ' | '.join(details) }</blockquote>\n"
-        else:
-            msg += "\n"
-            
-    return msg
+        lines.extend(["", "✅ <i>No matching events scheduled for today.</i>"])
+    else:
+        for event in events:
+            lines.extend(["", *event_lines(event)])
+        lines.extend(["", "⚠️ <i>Timing may change. Manage risk around major releases.</i>"])
+    message = "\n".join(lines)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        message = message[: MAX_MESSAGE_LENGTH - 80] + "\n\n<i>Additional events omitted due to message length.</i>"
+    return message
 
-def send_telegram(message):
-    """Sends the formatted HTML message to Telegram and returns the message ID if successful."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("❌ Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables are not set.")
-        print("Stdout representation of the message:")
-        print(message)
-        return None
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    
+
+def telegram(method, payload):
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not configured")
+    payload["chat_id"] = CHAT_ID
+    payload["parse_mode"] = "HTML"
+    payload["disable_web_page_preview"] = True
+    result = request_json(f"https://api.telegram.org/bot{TOKEN}/{method}", payload)
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram rejected {method}: {result.get('description', 'unknown error')}")
+    return result["result"]
+
+
+def send_message(text):
+    result = telegram("sendMessage", {"text": text})
+    print(f"Telegram message sent successfully (message id: {result['message_id']})")
+    return result["message_id"]
+
+
+def edit_message(message_id, text):
     try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            resp_data = json.loads(response.read().decode("utf-8"))
-            if resp_data.get("ok"):
-                msg_id = resp_data["result"]["message_id"]
-                print(f"✅ Telegram message sent successfully! Message ID: {msg_id}")
-                return msg_id
-            else:
-                print(f"❌ Telegram API Error: {resp_data}")
-                return None
-    except urllib.error.HTTPError as e:
-        print(f"❌ Telegram HTTP Error: {e.code} {e.reason}")
-        try:
-            print("Response:", e.read().decode("utf-8"))
-        except Exception:
-            pass
-        return None
-    except Exception as e:
-        print(f"❌ Telegram Send Error: {e}")
-        return None
+        telegram("editMessageText", {"message_id": message_id, "text": text})
+        print(f"Daily overview updated (message id: {message_id})")
+    except RuntimeError as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
 
-def edit_telegram_message(message_id, new_text):
-    """Edits an existing Telegram message with new HTML content."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"⚠️ Simulated Telegram Edit (Message {message_id}):")
-        print(new_text)
-        print("------------------------------------------")
+
+def should_create_overview(state, current):
+    if RUN_MODE in {"all", "overview"}:
         return True
-        
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/editMessageText"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "message_id": message_id,
-        "text": new_text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST"
-    )
-    
-    try:
-        with urllib.request.urlopen(req, timeout=15) as response:
-            resp_data = json.loads(response.read().decode("utf-8"))
-            if resp_data.get("ok"):
-                print(f"✅ Telegram message {message_id} updated successfully!")
-                return True
-            else:
-                print(f"❌ Telegram Edit API Error: {resp_data}")
-                return False
-    except urllib.error.HTTPError as e:
-        print(f"❌ Telegram Edit HTTP Error: {e.code} {e.reason}")
-        return False
-    except Exception as e:
-        print(f"❌ Telegram Edit Error: {e}")
-        return False
+    return state.get("daily_calendar_msg_id") is None and 7 <= current.hour < 12
+
+
+def process_overview(events, state):
+    message = build_overview(events)
+    digest = hashlib.sha256(message.encode()).hexdigest()
+    message_id = state.get("daily_calendar_msg_id")
+    if not message_id:
+        state["daily_calendar_msg_id"] = send_message(message)
+        state["daily_calendar_hash"] = digest
+        return True
+    if state.get("daily_calendar_hash") != digest:
+        edit_message(message_id, message)
+        state["daily_calendar_hash"] = digest
+        return True
+    print("Daily overview unchanged; no Telegram edit needed")
+    return False
+
+
+def process_alerts(events, state):
+    current = now_myt()
+    changed = False
+    for event in events:
+        identifier = event_id(event)
+        seconds_until = (event["datetime"] - current).total_seconds()
+        if 0 < seconds_until <= 10 * 60 and identifier not in state["sent_warnings"]:
+            minutes = max(1, round(seconds_until / 60))
+            message = "\n".join([
+                f"⚠️ <b>NEWS ALERT · {minutes} MINUTES</b>",
+                "────────────────────",
+                *event_lines(event, include_pairs=True),
+                "",
+                "🛡 <i>Expect volatility, wider spreads and possible slippage.</i>",
+            ])
+            send_message(message)
+            state["sent_warnings"].append(identifier)
+            changed = True
+        if seconds_until <= 0 and event["actual"] and identifier not in state["sent_announcements"]:
+            comparison_text = comparison(event["actual"], event["forecast"])
+            lines = [
+                "📢 <b>FOREX NEWS RELEASED</b>",
+                "────────────────────",
+                *event_lines(event, include_pairs=True),
+            ]
+            if comparison_text:
+                lines.extend(["", f"{comparison_text}."])
+            lines.extend(["", "<i>Above/below forecast is not automatically bullish or bearish; interpretation depends on the indicator.</i>"])
+            send_message("\n".join(lines))
+            state["sent_announcements"].append(identifier)
+            changed = True
+    return changed
+
 
 def main():
-    print("Forex Economic Calendar Bot starting...")
-    
-    # 1. Fetch
-    raw_data = fetch_calendar_data()
-    if not raw_data:
-        print("❌ No calendar data retrieved. Failing the workflow.")
-        sys.exit(1)
-        
-    # 2. Filter & Process
-    events = get_todays_events(raw_data)
-    print(f"Found {len(events)} matching events for today.")
-    
-    # 3. Load state
+    print(f"Forex Event Bot v2 starting in {RUN_MODE!r} mode")
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError("Required Telegram configuration is missing")
+    events = parse_events(fetch_events())
+    print(f"Found {len(events)} matching event(s) for today")
     state = load_state()
-    now = get_myt_now()
-    state_updated = False
-    
-    # 4. Check/Send Daily Calendar Overview
-    current_overview = format_html_message(events)
-    if not state.get("daily_calendar_msg_id"):
-        print("Sending initial daily calendar overview...")
-        msg_id = send_telegram(current_overview)
-        if not msg_id:
-            print("❌ Daily overview delivery failed.")
-            sys.exit(1)
-        state["daily_calendar_msg_id"] = msg_id
-        state_updated = True
-    else:
-        print(f"Updating existing daily calendar overview message ({state['daily_calendar_msg_id']})...")
-        if not edit_telegram_message(state["daily_calendar_msg_id"], current_overview):
-            print("❌ Daily overview update failed.")
-            sys.exit(1)
-        
-    # 5. Check 10-Minute Warnings & Rate Announcements
-    for e in events:
-        event_id = get_event_id(e)
-        event_time = e["datetime"]
-        
-        # Time difference in seconds between event time and now
-        time_diff = (event_time - now).total_seconds()
-        
-        # A. 10-Minute warning (Trigger if event starts in the next 10 minutes (600s) and has not started yet)
-        if 0 < time_diff <= 600:
-            if event_id not in state["sent_warnings"]:
-                emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
-                warning_msg = (
-                    f"⚠️ <b>Upcoming Forex Event (10 mins)</b>\n\n"
-                    f"{emoji} <b>{e['time_str']}</b> - <b>{escape_html(e['country'])}</b>\n"
-                    f"👉 <code>{escape_html(e['title'])}</code>\n"
-                )
-                if e["forecast"]:
-                    warning_msg += f"<blockquote>Fcst: {escape_html(e['forecast'])} | Prev: {escape_html(e['previous'])}</blockquote>"
-                
-                print(f"Sending 10-minute warning alert for: {e['title']}")
-                if send_telegram(warning_msg):
-                    state["sent_warnings"].append(event_id)
-                    state_updated = True
-                    
-        # B. Rate announcement (Trigger if event time has passed/is occurring now AND an actual value is available)
-        elif time_diff <= 0 and e["actual"]:
-            if event_id not in state["sent_announcements"]:
-                emoji = IMPACT_EMOJI.get(e["impact"], "⚪")
-                announcement_msg = (
-                    f"📢 <b>Forex Rate Announced</b>\n\n"
-                    f"{emoji} <b>{e['time_str']}</b> - <b>{escape_html(e['country'])}</b>\n"
-                    f"👉 <code>{escape_html(e['title'])}</code>\n"
-                    f"<blockquote>Act: <b>{escape_html(e['actual'])}</b> | Fcst: {escape_html(e['forecast'])} | Prev: {escape_html(e['previous'])}</blockquote>"
-                )
-                
-                print(f"Sending rate announcement alert for: {e['title']}")
-                if send_telegram(announcement_msg):
-                    state["sent_announcements"].append(event_id)
-                    state_updated = True
-                    
-    if state_updated:
-        save_state(state)
-        
-    print("Bot cycle finished.")
+    changed = False
+    if should_create_overview(state, now_myt()):
+        changed = process_overview(events, state) or changed
+    if RUN_MODE != "overview":
+        changed = process_alerts(events, state) or changed
+        if state.get("daily_calendar_msg_id"):
+            changed = process_overview(events, state) or changed
+    save_state(state)
+    print(f"Bot cycle finished; state changed: {changed}")
+
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
