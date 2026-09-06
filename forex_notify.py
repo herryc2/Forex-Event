@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import urllib.request
 import urllib.error
@@ -225,8 +226,7 @@ def send_telegram(message):
         print("❌ Error: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID environment variables are not set.")
         print("Stdout representation of the message:")
         print(message)
-        # Mock message ID for testing
-        return 999999
+        return None
         
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -310,8 +310,8 @@ def main():
     # 1. Fetch
     raw_data = fetch_calendar_data()
     if not raw_data:
-        print("❌ No calendar data retrieved. Exiting.")
-        return
+        print("❌ No calendar data retrieved. Failing the workflow.")
+        sys.exit(1)
         
     # 2. Filter & Process
     events = get_todays_events(raw_data)
@@ -327,12 +327,16 @@ def main():
     if not state.get("daily_calendar_msg_id"):
         print("Sending initial daily calendar overview...")
         msg_id = send_telegram(current_overview)
-        if msg_id:
-            state["daily_calendar_msg_id"] = msg_id
-            state_updated = True
+        if not msg_id:
+            print("❌ Daily overview delivery failed.")
+            sys.exit(1)
+        state["daily_calendar_msg_id"] = msg_id
+        state_updated = True
     else:
         print(f"Updating existing daily calendar overview message ({state['daily_calendar_msg_id']})...")
-        edit_telegram_message(state["daily_calendar_msg_id"], current_overview)
+        if not edit_telegram_message(state["daily_calendar_msg_id"], current_overview):
+            print("❌ Daily overview update failed.")
+            sys.exit(1)
         
     # 5. Check 10-Minute Warnings & Rate Announcements
     for e in events:
