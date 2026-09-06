@@ -1,8 +1,6 @@
 name: Forex Calendar Notifier
 
 on:
-  push:
-    branches: [main]  # Temporary one-time production test trigger
   schedule:
     - cron: "17 23 * * *"  # Daily at 07:17 Malaysia Time (UTC+8)
   workflow_dispatch:
